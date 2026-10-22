@@ -49,3 +49,18 @@ Uniquement en commits sur `dev` (ex. `chore(local): ...`). Jamais sur une branch
 
 ## PowerShell 5.1
 `&&` n'existe pas : utiliser `;` ou une commande par ligne.
+
+## Limite : ces fichiers n'existent que sur `dev`
+`FORK_WORKFLOW.md` et `CLAUDE.local.md` sont versionnés sur `dev` seulement. Sur une branche `feature/*`
+(partie d'`upstream/main`) ou dans un worktree créé depuis `upstream/main`
+(`git worktree add ../feat-xxx -b feature/xxx upstream/main`), ils sont absents : l'agent n'y charge donc
+ni `CLAUDE.local.md` ni cette note, et peut ignorer le workflow.
+
+Parades :
+- **Mémoire de Claude** (copie de la règle, indépendante de la branche) :
+  `C:\Users\azeve\.claude\projects\d--Users-azeve-Desktop-AutoClips-supoclip\memory\fork-git-workflow.md`.
+  Elle est chargée dans ce dossier de projet ; un worktree dans un autre dossier peut ne pas la voir.
+- Dans un worktree : recopier `CLAUDE.local.md` depuis `dev` (il est exclu de Git, aucun risque de PR) :
+  `git show dev:CLAUDE.local.md > ../feat-xxx/CLAUDE.local.md`
+- Ou, à défaut, dire à l'agent de lire `FORK_WORKFLOW.md` avec `git show dev:FORK_WORKFLOW.md`.
+- Toute modification de la règle doit être faite aux deux endroits (ces fichiers + la mémoire).
