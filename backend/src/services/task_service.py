@@ -40,6 +40,16 @@ from ..stream_source import cleanup_stream_path, cleanup_stream_task, seed_strea
 
 logger = logging.getLogger(__name__)
 PROCESSING_CACHE_VERSION = "20260319_grounded_segments_v1"
+# Sub-progress ticks are published to Redis freely but persisted this rarely.
+PROGRESS_DB_INTERVAL_SECONDS = 10.0
+ERROR_MESSAGE_MAX_CHARS = 300
+# Pipeline stage that was running when a task failed -> tasks.error_code.
+STAGE_ERROR_CODES = {
+    "download": "download_error",
+    "transcribe": "transcription_error",
+    "analyze": "analysis_error",
+    "render": "render_error",
+}
 
 
 class TaskService(ClipEditingMixin):
@@ -284,6 +294,18 @@ class TaskService(ClipEditingMixin):
         except Exception as exc:  # the worker can still resolve everything itself
             logger.warning("Could not seed stream source details: %s", exc)
 
+    @staticmethod
+    def _render_detail(done: int, total: int, elapsed: float) -> Dict[str, Any]:
+        """Sub-progress of the render stage after ``done`` of ``total`` clips."""
+        detail: Dict[str, Any] = {
+            "stage": "render",
+            "stage_progress": round(done / total * 100, 1) if total else 0,
+            "elapsed_seconds": round(elapsed),
+        }
+        if done > 0 and total > done:
+            detail["eta_seconds"] = round(elapsed / done * (total - done))
+        return detail
+
     @exclusive_task_run
     @media_work
     async def process_task(
@@ -314,6 +336,8 @@ class TaskService(ClipEditingMixin):
         video_path: Optional[Path] = None
         pending_clip_path: Optional[Path] = None
         clips_output_dir = Path(self.config.temp_dir) / "clips"
+        # Last pipeline stage that reported in, so a failure can name it.
+        current_stage: Optional[str] = None
 
         async def check_cancelled():
             if should_cancel and await should_cancel():
@@ -368,18 +392,34 @@ class TaskService(ClipEditingMixin):
                 raise TaskCancelled()
 
             # Progress callback wrapper
+            last_tick_write = 0.0
+
             async def update_progress(
-                progress: int, message: str, status: str = "processing"
+                progress: int,
+                message: str,
+                status: str = "processing",
+                detail: Optional[Dict[str, Any]] = None,
             ):
+                nonlocal last_tick_write, current_stage
+                if detail and detail.get("stage"):
+                    current_stage = detail["stage"]
                 await check_cancelled()
-                changed = await self.task_repo.update_task_status(
-                    self.db, task_id, status, progress=progress,
-                    progress_message=message, expected_statuses=["processing"],
-                )
-                if changed is False:
-                    raise TaskCancelled()
+                # Intermediate ticks go to Redis only; the database keeps a
+                # snapshot at most every PROGRESS_DB_INTERVAL_SECONDS.
+                is_tick = bool(detail and detail.get("tick"))
+                if not is_tick or perf_counter() - last_tick_write >= PROGRESS_DB_INTERVAL_SECONDS:
+                    last_tick_write = perf_counter()
+                    changed = await self.task_repo.update_task_status(
+                        self.db, task_id, status, progress=progress,
+                        progress_message=message, expected_statuses=["processing"],
+                    )
+                    if changed is False:
+                        raise TaskCancelled()
                 if progress_callback:
-                    await progress_callback(progress, message, status)
+                    if detail:
+                        await progress_callback(progress, message, status, detail=detail)
+                    else:
+                        await progress_callback(progress, message, status)
 
             # Process video with progress updates
             max_video_duration = self.config.max_video_duration
@@ -473,6 +513,7 @@ class TaskService(ClipEditingMixin):
                 await update_progress(
                     clip_progress,
                     f"Creating clip {i + 1}/{total_clips}...",
+                    detail=self._render_detail(i, total_clips, perf_counter() - render_start),
                 )
 
                 # A partial download is a concatenated timeline. Render against
@@ -539,6 +580,17 @@ class TaskService(ClipEditingMixin):
                     )
                     if clip_record:
                         await clip_ready_callback(i, total_clips, clip_record)
+
+                # Refresh the clock/ETA now that one more clip is done.
+                if i + 1 < total_clips:
+                    await update_progress(
+                        70 + int(((i + 1) / total_clips) * 25),
+                        f"Clip {i + 1}/{total_clips} ready",
+                        detail={
+                            **self._render_detail(i + 1, total_clips, perf_counter() - render_start),
+                            "tick": True,
+                        },
+                    )
 
             stage_timings["render_seconds"] = round(
                 perf_counter() - render_start, 3
@@ -608,15 +660,21 @@ class TaskService(ClipEditingMixin):
                     expected_statuses=["queued", "processing"],
                 )
                 raise
+            # The full error stays in the logs; the page shows a bounded copy.
+            error_text = str(e)
+            if len(error_text) > ERROR_MESSAGE_MAX_CHARS:
+                error_text = error_text[: ERROR_MESSAGE_MAX_CHARS - 1].rstrip() + "…"
             failed = await self.task_repo.update_task_status(
-                self.db, task_id, "error", progress=0, progress_message=str(e),
+                self.db, task_id, "error", progress=0, progress_message=error_text,
                 expected_statuses=["queued", "processing"],
             )
             if failed is False:
                 raise
-            error_code = "task_error"
+            error_code = STAGE_ERROR_CODES.get(current_stage or "", "task_error")
             message = str(e).lower()
-            if "download" in message or "youtube" in message:
+            if error_code != "task_error":
+                pass
+            elif "download" in message or "youtube" in message:
                 error_code = "download_error"
             elif "analysis" in message:
                 error_code = "analysis_error"
@@ -633,7 +691,7 @@ class TaskService(ClipEditingMixin):
             )
             if progress_callback:
                 try:
-                    await progress_callback(0, str(e), "error")
+                    await progress_callback(0, error_text, "error")
                 except Exception:
                     logger.exception("Could not publish task failure for %s", task_id)
             raise

@@ -1,7 +1,7 @@
 "use client";
 
 import Link from "next/link";
-import { useEffect } from "react";
+import { useEffect, useState } from "react";
 import { useTranslations } from "next-intl";
 import {
   AudioLines, Check, ChevronLeft, ChevronRight, Clapperboard, Download, Flame, Loader2, MessageSquare,
@@ -12,6 +12,7 @@ import DynamicVideoPlayer from "@/components/dynamic-video-player";
 import { TranscriptPreview } from "@/components/transcript-preview";
 import { Button } from "@/components/ui/button";
 import { Dialog, DialogContent, DialogDescription, DialogTitle } from "@/components/ui/dialog";
+import type { ProgressEvent } from "@/hooks/use-task-progress";
 import { getClipUrl } from "@/lib/clip-actions";
 import { formatClipDuration } from "@/lib/generations";
 import { cn } from "@/lib/utils";
@@ -221,7 +222,7 @@ export function ClipFocus({ clip, taskId, index, total, busy, editable, onNaviga
 
 const STEPS = [
   { id: "fetching", icon: Download, until: 20 },
-  { id: "transcribing", icon: AudioLines, until: 45 },
+  { id: "transcribing", icon: AudioLines, until: 50 },
   { id: "finding", icon: Sparkles, until: 65 },
   { id: "rendering", icon: Clapperboard, until: 100 },
 ] as const;
@@ -235,10 +236,60 @@ function stepFromMessage(message: string) {
   return null;
 }
 
-export function ProcessingPanel({ status, progress, message, readyCount }: { status: string; progress: number; message: string; readyCount: number }) {
+const STAGE_STEP: Record<string, number> = { download: 0, transcribe: 1, analyze: 2, render: 3 };
+
+/** Live sub-progress of the current step; absent for older backends and for steps that report none. */
+export interface ProgressDetail {
+  stage?: string;
+  stageProgress?: number;
+  etaSeconds?: number | null;
+  elapsedSeconds?: number;
+  waiting?: boolean;
+  receivedAt: number;
+}
+
+export function progressDetailFrom(event: ProgressEvent): ProgressDetail | null {
+  if (!event.stage) return null;
+  return {
+    stage: event.stage,
+    stageProgress: event.stage_progress,
+    etaSeconds: event.eta_seconds,
+    elapsedSeconds: event.elapsed_seconds,
+    waiting: event.waiting,
+    receivedAt: Date.now(),
+  };
+}
+
+export function formatClock(totalSeconds: number) {
+  const seconds = Math.max(0, Math.floor(totalSeconds));
+  const hours = Math.floor(seconds / 3600);
+  const minutes = Math.floor((seconds % 3600) / 60);
+  const rest = String(seconds % 60).padStart(2, "0");
+  return hours > 0 ? `${hours}:${String(minutes).padStart(2, "0")}:${rest}` : `${minutes}:${rest}`;
+}
+
+export function formatEta(totalSeconds: number) {
+  const minutes = Math.floor(totalSeconds / 60);
+  if (minutes < 1) return "<1m";
+  return minutes >= 60 ? `${Math.floor(minutes / 60)}h ${String(minutes % 60).padStart(2, "0")}m` : `${minutes}m`;
+}
+
+export function ProcessingPanel({ status, progress, message, readyCount, detail }: { status: string; progress: number; message: string; readyCount: number; detail?: ProgressDetail | null }) {
   const t = useTranslations("task");
+  const [now, setNow] = useState(() => Date.now());
+  useEffect(() => {
+    if (!detail) return;
+    setNow(Date.now());
+    const timer = window.setInterval(() => setNow(Date.now()), 1000);
+    return () => window.clearInterval(timer);
+  }, [detail]);
   const byProgress = STEPS.findIndex((step) => progress < step.until);
-  const activeStep = status === "queued" ? -1 : stepFromMessage(message) ?? (byProgress === -1 ? STEPS.length - 1 : byProgress);
+  const activeStep = status === "queued" ? -1 : (detail?.stage ? STAGE_STEP[detail.stage] : undefined) ?? stepFromMessage(message) ?? (byProgress === -1 ? STEPS.length - 1 : byProgress);
+  // Between events the clock keeps moving from the last reported values.
+  const sinceEvent = detail ? Math.max(0, (now - detail.receivedAt) / 1000) : 0;
+  const elapsed = detail?.elapsedSeconds != null ? detail.elapsedSeconds + sinceEvent : null;
+  const eta = detail?.etaSeconds != null ? Math.max(0, detail.etaSeconds - sinceEvent) : null;
+  const stagePercent = detail && !detail.waiting && detail.stageProgress != null ? Math.min(100, Math.max(0, detail.stageProgress)) : null;
   return (
     <section className="overflow-hidden rounded-2xl border bg-background" aria-live="polite">
       <div className="relative h-1 bg-muted">
@@ -247,6 +298,19 @@ export function ProcessingPanel({ status, progress, message, readyCount }: { sta
       <div className="flex flex-col gap-6 p-5 sm:p-6 md:flex-row md:items-center md:justify-between">
         <div className="min-w-0">
           <p className="shimmer text-lg font-semibold">{message || (status === "queued" ? t("waiting") : t("processing"))}</p>
+          {stagePercent !== null && (
+            <div className="mt-3 max-w-md" role="progressbar" aria-valuemin={0} aria-valuemax={100} aria-valuenow={Math.round(stagePercent)} aria-label={t("stageProgress", { percent: Math.round(stagePercent) })}>
+              <div className="h-1.5 overflow-hidden rounded-full bg-muted">
+                <div className="h-full rounded-full bg-brand transition-[width] duration-700 ease-out" style={{ width: `${stagePercent}%` }} />
+              </div>
+            </div>
+          )}
+          {elapsed !== null && (
+            <p className="mt-2 text-sm tabular-nums text-muted-foreground">
+              {t("elapsed", { time: formatClock(elapsed) })}
+              {eta !== null && stagePercent !== null ? ` · ${t("etaLeft", { time: formatEta(eta) })}` : ""}
+            </p>
+          )}
           <p className="mt-1 text-sm text-muted-foreground">
             {readyCount > 0 ? t("clipsReady", { count: readyCount }) : t("grabCoffee")}
           </p>
@@ -276,12 +340,13 @@ export function ProcessingPanel({ status, progress, message, readyCount }: { sta
   );
 }
 
-export function EmptyState({ icon, title, body, tone, children }: { icon: React.ReactNode; title: string; body: string; tone?: "error"; children?: React.ReactNode }) {
+export function EmptyState({ icon, title, body, tone, detail, children }: { icon: React.ReactNode; title: string; body: string; tone?: "error"; detail?: React.ReactNode; children?: React.ReactNode }) {
   return (
     <div className="flex flex-col items-center rounded-2xl border border-dashed px-6 py-16 text-center">
       <span className={cn("flex size-14 items-center justify-center rounded-2xl", tone === "error" ? "bg-red-50 text-red-600" : "bg-muted text-muted-foreground")}>{icon}</span>
       <h2 className="mt-4 text-lg font-semibold">{title}</h2>
       <p className="mt-1 max-w-md text-sm text-muted-foreground">{body}</p>
+      {detail && <div className="mt-4 max-w-md rounded-lg border bg-muted/40 px-3 py-2 text-left text-xs text-muted-foreground">{detail}</div>}
       {children && <div className="mt-6 flex gap-2">{children}</div>}
     </div>
   );

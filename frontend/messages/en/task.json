@@ -120,6 +120,10 @@
   "clipsReady": "{count, plural, one {# clip ready below — more on the way.} other {# clips ready below — more on the way.}}",
   "grabCoffee": "Grab a coffee — clips appear here the moment they render.",
   "percentComplete": "{progress}% complete",
+  "elapsed": "{time} elapsed",
+  "etaLeft": "about {time} left",
+  "stageProgress": "{percent}% of this step",
+  "failedStage": "Failed during: {step}",
   "transcript": {
     "heading": "Transcript",
     "seeMore": "See more",

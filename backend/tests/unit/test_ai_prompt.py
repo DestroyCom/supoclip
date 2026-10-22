@@ -76,6 +76,29 @@ def test_build_transcript_analysis_prompt_mentions_broll_only_when_enabled():
     assert "B-roll opportunities" in with_broll
 
 
+def test_prompt_pins_title_language_to_configured_transcription_language(monkeypatch):
+    from src import ai
+
+    transcript = "[00:12 - 00:21] Une phrase d'ouverture"
+    for language, expected, unexpected in [
+        ("fr", "in French", None),  # the French example only appears for fr
+        ("es", "in Spanish", "L'erreur"),
+        ("en_us", "in English", "L'erreur"),
+        ("", "same language as the transcript text", "L'erreur"),
+    ]:
+        monkeypatch.setattr(
+            ai, "get_config", lambda lang=language: SimpleNamespace(transcription_language=lang)
+        )
+        prompt = build_transcript_analysis_prompt(transcript=transcript)
+        assert expected in prompt
+        if unexpected:
+            assert unexpected not in prompt
+    monkeypatch.setattr(
+        ai, "get_config", lambda: SimpleNamespace(transcription_language="fr")
+    )
+    assert "L'erreur" in build_transcript_analysis_prompt(transcript=transcript)
+
+
 def test_ollama_llm_builds_native_ollama_model():
     runtime_config = SimpleNamespace(
         llm="ollama:gpt-oss:20b",

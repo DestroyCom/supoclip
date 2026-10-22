@@ -2,10 +2,10 @@
 
 import { CaptionSizeControl } from "@/components/caption-size-control";
 
-import { useState, useEffect, useCallback } from "react";
+import { useState, useEffect, useCallback, useRef } from "react";
 import { useLocale, useTranslations } from "next-intl";
 import { toast } from "sonner";
-import { useTaskProgress } from "@/hooks/use-task-progress";
+import { useTaskProgress, type ProgressEvent } from "@/hooks/use-task-progress";
 import { StatusBadge, ACTIVE_TASK_STATUSES } from "@/components/app/status-badge";
 import { getClipUrl, requestAction, downloadBlob, EXPORT_PRESETS } from "@/lib/clip-actions";
 import { trackClipExport } from "@/lib/clip-export-tracking";
@@ -55,7 +55,7 @@ import {
 } from "lucide-react";
 import { Tooltip, TooltipTrigger, TooltipContent } from "@/components/ui/tooltip";
 import Link from "next/link";
-import { ClipTile, ClipFocus, ProcessingPanel, EmptyState } from "@/components/app/clip-wall";
+import { ClipTile, ClipFocus, ProcessingPanel, EmptyState, progressDetailFrom, type ProgressDetail } from "@/components/app/clip-wall";
 import { intlLocale } from "@/i18n/config";
 import { timeAgo } from "@/lib/generations";
 import { VIDEO_SOURCE_LABELS, VideoSourceIcon, videoSourceKind, type VideoSourceKind } from "@/components/video-source-icon";
@@ -101,6 +101,7 @@ interface TaskDetails {
   status: string;
   progress?: number;
   progress_message?: string;
+  error_code?: string | null;
   clips_count: number;
   created_at: string;
   updated_at: string;
@@ -113,6 +114,23 @@ interface TaskDetails {
   remove_filler_words?: boolean;
   filtered_words?: string[];
   share_enabled?: boolean;
+}
+
+const FAILED_STEP: Record<string, string> = {
+  download_error: "fetching", transcription_error: "transcribing", analysis_error: "finding", render_error: "rendering",
+};
+
+/** Which step failed and the (server-truncated) reason, when the backend recorded them. */
+function failureDetail(code: string | null | undefined, message: string | undefined, stageLabel: (step: string) => string, stepName: (id: string) => string) {
+  const step = code ? FAILED_STEP[code] : undefined;
+  const reason = message?.trim().slice(0, 300);
+  if (!step && !reason) return null;
+  return (
+    <div className="space-y-1">
+      {step && <p className="font-medium text-foreground">{stageLabel(stepName(step))}</p>}
+      {reason && <p className="break-words">{reason}</p>}
+    </div>
+  );
 }
 
 function sourceLabel(source: VideoSourceKind, uploadLabel: string) {
@@ -132,6 +150,9 @@ export default function TaskPage() {
   const [error, setError] = useState<string | null>(null);
   const [progress, setProgress] = useState(0);
   const [progressMessage, setProgressMessage] = useState("");
+  const [progressDetail, setProgressDetail] = useState<ProgressDetail | null>(null);
+  // fetchTaskStatus is declared before the progress hook that owns ingestion.
+  const ingestProgress = useRef<((event: ProgressEvent, source: "sse" | "db") => void) | null>(null);
   const [isEditing, setIsEditing] = useState(false);
   const [editedTitle, setEditedTitle] = useState("");
   const [showDeleteDialog, setShowDeleteDialog] = useState(false);
@@ -248,8 +269,9 @@ export default function TaskPage() {
         }
 
         const taskData = await taskResponse.json();
-        setProgress(taskData.progress ?? 0);
-        setProgressMessage(taskData.progress_message ?? "");
+        const snapshot = { progress: taskData.progress ?? 0, message: taskData.progress_message ?? "", status: taskData.status };
+        if (ingestProgress.current) ingestProgress.current(snapshot, "db");
+        else { setProgress(snapshot.progress); setProgressMessage(snapshot.message); }
         setError(null);
         if (!background) {
         setProjectFontFamily(taskData.font_family ?? null);
@@ -350,17 +372,20 @@ export default function TaskPage() {
     void loadTemplates();
   }, []);
 
-  const { reconnecting } = useTaskProgress<Clip>({
+  const { reconnecting, ingest } = useTaskProgress<Clip>({
     taskId: String(params.id || ""),
     active: ACTIVE_TASK_STATUSES.includes(task?.status || ""),
     refresh: () => fetchTaskStatus(0, 0, true),
-    onProgress: (data) => {
+    onProgress: (data, source) => {
       if (typeof data.progress === "number") setProgress(data.progress);
       if (typeof data.message === "string") setProgressMessage(data.message);
+      setProgressDetail(source === "sse" ? progressDetailFrom(data) : null);
     },
     onClip: (clip) => setClips((current) =>
       [...current.filter((item) => item.id !== clip.id), clip].sort((a, b) => a.clip_order - b.clip_order)),
   });
+
+  ingestProgress.current = ingest;
 
   const runAction = async (name: string, action: () => Promise<void>) => {
     if (pendingAction) return;
@@ -762,7 +787,7 @@ export default function TaskPage() {
 
         {isActive && task ? (
           <div className="space-y-8">
-            <ProcessingPanel status={task.status} progress={progress} message={progressMessage} readyCount={clips.length} />
+            <ProcessingPanel status={task.status} progress={progress} message={progressMessage} detail={progressDetail} readyCount={clips.length} />
             {clips.length > 0 && (
               <div className="grid grid-cols-2 gap-x-4 gap-y-6 sm:grid-cols-3 lg:grid-cols-4 xl:grid-cols-5">
                 {sortedClips.map(renderTile)}
@@ -774,7 +799,8 @@ export default function TaskPage() {
         ) : task.status === "cancelled" && clips.length === 0 ? (
           <EmptyState icon={<PauseCircle className="size-7" />} title={t("cancelledTitle")} body={t("cancelledBody")} />
         ) : task.status === "error" ? (
-          <EmptyState tone="error" icon={<AlertCircle className="size-7" />} title={t("failedTitle")} body={t("failedBody")}>
+          <EmptyState tone="error" icon={<AlertCircle className="size-7" />} title={t("failedTitle")} body={t("failedBody")}
+            detail={failureDetail(task.error_code, task.progress_message, (step) => t("failedStage", { step }), (id) => t(`steps.${id}`))}>
             <Button asChild variant="outline"><Link href="/"><ArrowLeft className="size-4" />{t("backHome")}</Link></Button>
           </EmptyState>
         ) : clips.length === 0 ? (

@@ -1,10 +1,14 @@
 """Transcription helpers for the video pipeline."""
 
+from contextlib import contextmanager
+from types import SimpleNamespace
 from typing import Any
 from typing import Dict
 from typing import List
 from typing import Optional
 from pathlib import Path
+import sys
+import threading
 import assemblyai as aai
 from ..config import get_config
 import httpx
@@ -22,9 +26,14 @@ from .common import (
     TRANSCRIPT_CACHE_SCHEMA_VERSION,
     _WHISPER_AVAILABLE,
     _WHISPER_MODEL_CACHE,
+    _WHISPER_TRANSCRIBE_LOCK,
     _whisper,
     logger,
 )
+
+# Whisper audio frames are 10 ms (HOP_LENGTH 160 samples at 16 kHz).
+WHISPER_SECONDS_PER_FRAME = 0.01
+WHISPER_LOCK_POLL_SECONDS = 5.0
 from .ffmpeg import (
     run_ffmpeg_command,
     select_audio_stream_index,
@@ -186,23 +195,141 @@ def _get_whisper_model(model_name: str = "base"):
     return _WHISPER_MODEL_CACHE[model_name]
 
 
+class TranscriptionAborted(RuntimeError):
+    """Raised inside a Whisper job whose caller asked it to stop."""
+
+
+def _make_whisper_progress_bar(on_progress, cancel_event):
+    """Build a stand-in for the tqdm bar ``whisper.transcribe`` creates.
+
+    Whisper only enters it, calls ``update(frames)`` after each 30 s window and
+    leaves it, so a minimal duck type is enough.
+    """
+
+    class _WhisperProgressBar:
+        def __init__(self, *_args, total=None, **_kwargs):
+            self.total = total or 0
+            self.done = 0
+            self.started = time.monotonic()
+
+        def update(self, n=1):
+            self.done += n
+            if cancel_event is not None and cancel_event.is_set():
+                raise TranscriptionAborted("Transcription stopped")
+            total_seconds = self.total * WHISPER_SECONDS_PER_FRAME
+            if on_progress is None or total_seconds <= 0:
+                return
+            processed = min(self.done, self.total) * WHISPER_SECONDS_PER_FRAME
+            elapsed = time.monotonic() - self.started
+            eta = (
+                (total_seconds - processed) * elapsed / processed
+                if processed > 0 and elapsed > 0
+                else None
+            )
+            try:
+                on_progress(processed, total_seconds, elapsed, eta)
+            except TranscriptionAborted:
+                raise
+            except Exception:
+                logger.debug("Whisper progress callback failed", exc_info=True)
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_exc):
+            return False
+
+        def close(self):
+            pass
+
+    return _WhisperProgressBar
+
+
+@contextmanager
+def _whisper_progress_patch(on_progress, cancel_event):
+    """Swap whisper.transcribe's tqdm for a progress reporter during one call.
+
+    Only that module's name is rebound, always restored, and the caller holds
+    ``_WHISPER_TRANSCRIBE_LOCK`` so no other thread observes the swap. If the
+    installed Whisper differs from what we expect, transcription simply runs
+    without progress.
+    """
+    # ``whisper.transcribe`` the attribute is the function; the module is in sys.modules.
+    module = sys.modules.get("whisper.transcribe")
+    original = getattr(module, "tqdm", None)
+    if on_progress is None and cancel_event is None:
+        yield
+        return
+    if module is None or not callable(getattr(original, "tqdm", None)):
+        logger.warning("Unexpected Whisper internals; transcribing without progress")
+        yield
+        return
+    module.tqdm = SimpleNamespace(
+        tqdm=_make_whisper_progress_bar(on_progress, cancel_event)
+    )
+    try:
+        yield
+    finally:
+        module.tqdm = original
+
+
 def transcribe_with_whisper(
-    video_path: Path, model_name: str = "base", language: Optional[str] = None
+    video_path: Path,
+    model_name: str = "base",
+    language: Optional[str] = None,
+    *,
+    on_progress=None,
+    on_waiting=None,
+    cancel_event: Optional[threading.Event] = None,
+    task_id: Optional[str] = None,
 ) -> Dict[str, Any]:
     """Transcribe video using local Whisper with word-level timestamps.
 
     ``language`` None lets Whisper detect it; AssemblyAI-style codes such as
     ``en_us`` are reduced to the ISO 639-1 base Whisper expects.
+
+    The model is shared by every job thread and Whisper's KV-cache hooks sit on
+    its layers, so transcriptions are serialized. ``on_waiting(seconds)`` is
+    called every few seconds while queued behind another job;
+    ``on_progress(processed_s, total_s, elapsed_s, eta_s)`` after each window.
+    Setting ``cancel_event`` makes a waiting job give up and a running one stop
+    at its next window (a thread cannot be killed, so the lock is held until then).
     """
     audio_path = _prepare_audio_for_transcription(video_path)
-    model = _get_whisper_model(model_name)
+    label = task_id or video_path.name
     whisper_language = language.split("_", 1)[0] if language else None
+
+    waiting_since = time.monotonic()
+    while not _WHISPER_TRANSCRIBE_LOCK.acquire(timeout=WHISPER_LOCK_POLL_SECONDS):
+        if cancel_event is not None and cancel_event.is_set():
+            raise TranscriptionAborted("Transcription stopped while waiting")
+        if on_waiting is not None:
+            try:
+                on_waiting(time.monotonic() - waiting_since)
+            except Exception:
+                logger.debug("Whisper waiting callback failed", exc_info=True)
+    acquired_at = time.monotonic()
     logger.info(
-        "Starting Whisper transcription with model: %s (language: %s)",
-        model_name,
-        whisper_language or "auto",
+        "Whisper lock acquired by %s after waiting %.1fs", label, acquired_at - waiting_since
     )
-    return model.transcribe(str(audio_path), word_timestamps=True, language=whisper_language)
+    try:
+        if cancel_event is not None and cancel_event.is_set():
+            raise TranscriptionAborted("Transcription stopped while waiting")
+        model = _get_whisper_model(model_name)
+        logger.info(
+            "Starting Whisper transcription with model: %s (language: %s)",
+            model_name,
+            whisper_language or "auto",
+        )
+        with _whisper_progress_patch(on_progress, cancel_event):
+            return model.transcribe(
+                str(audio_path), word_timestamps=True, language=whisper_language
+            )
+    finally:
+        _WHISPER_TRANSCRIBE_LOCK.release()
+        logger.info(
+            "Whisper lock released by %s after %.1fs", label, time.monotonic() - acquired_at
+        )
 
 
 def _whisper_result_to_transcript_data(whisper_result: Dict[str, Any]) -> Dict[str, Any]:
@@ -320,19 +447,24 @@ def get_video_transcript(
     video_path: Path,
     speech_model: str = "universal",
     source_url: Optional[str] = None,
+    *,
+    whisper_options: Optional[Dict[str, Any]] = None,
 ) -> str:
     """Get a video transcript using the configured provider.
 
     Dispatches to AssemblyAI, local Whisper, or YouTube captions based on
     ``TRANSCRIPTION_PROVIDER``. ``source_url`` enables the youtube_captions
     provider, which needs the original URL rather than a local file path.
+    ``whisper_options`` (progress/cancel hooks) only applies to Whisper.
     """
     logger.info(f"Getting transcript for: {video_path}")
     runtime_config = get_config()
     provider = runtime_config.transcription_provider
 
     if provider == "whisper":
-        return _get_transcript_with_whisper(video_path, runtime_config)
+        return _get_transcript_with_whisper(
+            video_path, runtime_config, **(whisper_options or {})
+        )
     if provider == "youtube_captions":
         if not source_url:
             raise ValueError(
@@ -413,12 +545,14 @@ def _get_transcript_with_assemblyai(
         client.http_client.close()
 
 
-def _get_transcript_with_whisper(video_path: Path, runtime_config) -> str:
+def _get_transcript_with_whisper(video_path: Path, runtime_config, **options) -> str:
     """Get transcript using local Whisper with word-level timestamps."""
     model_name = runtime_config.whisper_model
-    logger.info("Starting Whisper transcription with model: %s", model_name)
     whisper_result = transcribe_with_whisper(
-        video_path, model_name, runtime_config.transcription_language or None
+        video_path,
+        model_name,
+        runtime_config.transcription_language or None,
+        **options,
     )
 
     formatted_lines = format_transcript_for_analysis(whisper_result)

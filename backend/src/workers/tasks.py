@@ -3,6 +3,7 @@ Worker tasks - background jobs processed by arq workers.
 """
 
 import logging
+import os
 from typing import Dict, Any, Optional
 import json
 from arq import Retry, cron
@@ -67,9 +68,12 @@ async def process_video_task(
         try:
             # Progress callback
             async def update_progress(
-                percent: int, message: str, status: str = "processing"
+                percent: int,
+                message: str,
+                status: str = "processing",
+                detail: Dict[str, Any] | None = None,
             ):
-                await progress.update(percent, message, status)
+                await progress.update(percent, message, status, detail=detail)
                 logger.info(f"Task {task_id}: {percent}% - {message}")
 
             async def should_cancel() -> bool:
@@ -225,7 +229,10 @@ class WorkerSettings:
 
     # Retry settings
     max_tries = 3  # Retry failed jobs up to 3 times
-    job_timeout = 10800  # 3 hour timeout for video processing
+    # Default is 3 hours; a long CPU Whisper run (and time spent waiting for
+    # its turn at the transcription lock) counts against it. Raise it with
+    # WORKER_JOB_TIMEOUT_SECONDS.
+    job_timeout = int(os.getenv("WORKER_JOB_TIMEOUT_SECONDS", "10800"))
 
     # Worker pool settings
     max_jobs = 4  # Process up to 4 jobs simultaneously

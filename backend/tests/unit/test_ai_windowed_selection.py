@@ -336,3 +336,47 @@ async def test_performance_context_shapes_windows_and_the_final_rerank(monkeypat
     assert guard in rerank_prompt
     assert all(guard in call.args[0] for call in agent.run.await_args_list)
     assert context not in ai.build_candidate_rerank_prompt([_segment("00:30", "01:00")])
+
+
+@pytest.mark.asyncio
+async def test_window_progress_counts_every_window_even_failed_ones(monkeypatch):
+    calls = {"n": 0}
+
+    async def fake_run(_agent, _prompt):
+        calls["n"] += 1
+        if calls["n"] == 2:
+            raise RuntimeError("model hiccup")
+        return SimpleNamespace(output=SimpleNamespace(most_relevant_segments=[]))
+
+    monkeypatch.setattr(ai, "_run_transcript_analysis", fake_run)
+    monkeypatch.setattr(ai, "build_transcript_analysis_prompt", lambda **_: "prompt")
+    monkeypatch.setattr(ai, "_filter_clip_signals_for_window", lambda *_: None)
+    reported = []
+
+    async def on_window_done(done, total):
+        reported.append((done, total))
+
+    windows = [{"transcript": "x", "start": i * 600, "end": (i + 1) * 600} for i in range(4)]
+    analyses = await ai._analyze_transcript_windows(
+        object(), windows, False, None, on_window_done=on_window_done
+    )
+
+    assert len(analyses) == 3
+    assert sorted(reported) == [(1, 4), (2, 4), (3, 4), (4, 4)]
+
+
+@pytest.mark.asyncio
+async def test_a_failing_progress_callback_never_fails_a_window(monkeypatch):
+    async def fake_run(_agent, _prompt):
+        return SimpleNamespace(output=SimpleNamespace(most_relevant_segments=[]))
+
+    monkeypatch.setattr(ai, "_run_transcript_analysis", fake_run)
+    monkeypatch.setattr(ai, "build_transcript_analysis_prompt", lambda **_: "prompt")
+    monkeypatch.setattr(ai, "_filter_clip_signals_for_window", lambda *_: None)
+
+    async def broken(_done, _total):
+        raise RuntimeError("task cancelled")
+
+    windows = [{"transcript": "x", "start": 0, "end": 600}]
+    analyses = await ai._analyze_transcript_windows(object(), windows, False, None, on_window_done=broken)
+    assert len(analyses) == 1

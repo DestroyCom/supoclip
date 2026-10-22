@@ -8,8 +8,12 @@ from typing import List, Dict, Any, Optional, Callable, Awaitable
 import logging
 import json
 import subprocess
+import threading
+import time
 import uuid
 
+from ..media.transcription import TranscriptionAborted
+from ..repositories.edit_transaction import TaskCancelled
 from ..utils.async_helpers import run_in_thread
 from ..youtube_utils import (
     async_get_youtube_video_info,
@@ -65,6 +69,115 @@ from ..stream_source import (
 
 logger = logging.getLogger(__name__)
 UPLOAD_URL_PREFIX = "upload://"
+
+# Transcription spans 30-50% of the overall task progress.
+TRANSCRIBE_PROGRESS_START = 30
+TRANSCRIBE_PROGRESS_SPAN = 20
+# Analysis runs 50-70%; the last points are left for the rerank call.
+ANALYZE_PROGRESS_START = 50
+ANALYZE_PROGRESS_SPAN = 18
+PROGRESS_TICK_SECONDS = 2.0
+
+
+def _format_clock(seconds: float) -> str:
+    seconds = max(0, int(seconds))
+    hours, rest = divmod(seconds, 3600)
+    minutes, secs = divmod(rest, 60)
+    return f"{hours}:{minutes:02d}:{secs:02d}" if hours else f"{minutes}:{secs:02d}"
+
+
+def _format_eta(seconds: float) -> str:
+    minutes = int(seconds // 60)
+    if minutes < 1:
+        return "<1m"
+    hours, minutes = divmod(minutes, 60)
+    return f"{hours}h {minutes:02d}m" if hours else f"{minutes}m"
+
+
+class _WhisperProgressBridge:
+    """Carry Whisper's worker-thread callbacks onto the event loop.
+
+    Callbacks run in the transcription thread; the progress callback is async
+    (database + Redis), so each report is scheduled with
+    ``run_coroutine_threadsafe`` and never awaited here. A report that fails
+    because the task was cancelled stops the transcription at its next window.
+    """
+
+    def __init__(self, loop, progress_callback, stop_event):
+        self.loop = loop
+        self.progress_callback = progress_callback
+        self.stop_event = stop_event
+        self.user_cancelled = False
+        self._last_report = 0.0
+        self._last_percent = -1
+
+    def _report(self, progress: int, message: str, detail: Dict[str, Any]) -> None:
+        future = asyncio.run_coroutine_threadsafe(
+            self.progress_callback(progress, message, "processing", detail=detail),
+            self.loop,
+        )
+        future.add_done_callback(self._after_report)
+
+    def _after_report(self, future) -> None:
+        if future.cancelled():
+            return
+        error = future.exception()
+        if isinstance(error, TaskCancelled):
+            self.user_cancelled = True
+            self.stop_event.set()
+        elif error is not None:
+            logger.debug("Transcription progress update failed: %s", error)
+
+    def on_waiting(self, waited_seconds: float) -> None:
+        self._report(
+            TRANSCRIBE_PROGRESS_START,
+            f"Waiting for another transcription… ({_format_clock(waited_seconds)})",
+            {
+                "stage": "transcribe",
+                "stage_progress": 0,
+                "waiting": True,
+                "elapsed_seconds": round(waited_seconds),
+                "tick": True,
+            },
+        )
+
+    def on_progress(
+        self,
+        processed_seconds: float,
+        total_seconds: float,
+        elapsed_seconds: float,
+        eta_seconds: Optional[float],
+    ) -> None:
+        if self.stop_event.is_set():
+            raise TranscriptionAborted("Transcription stopped")
+        fraction = min(1.0, processed_seconds / total_seconds)
+        percent = int(fraction * 100)
+        now = time.monotonic()
+        if (
+            fraction < 1.0
+            and now - self._last_report < PROGRESS_TICK_SECONDS
+            and percent <= self._last_percent
+        ):
+            return
+        self._last_report = now
+        self._last_percent = percent
+        message = (
+            f"Transcribing {percent}% — {_format_clock(processed_seconds)} / "
+            f"{_format_clock(total_seconds)} of audio"
+        )
+        if eta_seconds is not None and fraction < 1.0:
+            message += f", ~{_format_eta(eta_seconds)} left"
+        self._report(
+            TRANSCRIBE_PROGRESS_START + int(fraction * TRANSCRIBE_PROGRESS_SPAN),
+            message,
+            {
+                "stage": "transcribe",
+                "stage_progress": round(fraction * 100, 1),
+                "eta_seconds": None if eta_seconds is None else round(eta_seconds),
+                "elapsed_seconds": round(elapsed_seconds),
+                "tick": True,
+            },
+        )
 
 
 class VideoService:
@@ -259,11 +372,17 @@ class VideoService:
         video_path: Path,
         processing_mode: str = "balanced",
         source_url: Optional[str] = None,
+        *,
+        task_id: Optional[str] = None,
+        progress_callback: Optional[Callable[..., Awaitable[None]]] = None,
     ) -> str:
         """
         Generate transcript from video using the configured provider
         (assemblyai, whisper, or youtube_captions).
         Runs in thread pool to avoid blocking.
+
+        With ``progress_callback`` and the Whisper provider, live progress is
+        reported while it runs; other providers are unaffected.
         """
         logger.info(f"Generating transcript for: {video_path}")
         speech_model = "best"
@@ -273,9 +392,54 @@ class VideoService:
         if processing_mode == "fast" and runtime_config.transcription_provider == "assemblyai":
             speech_model = runtime_config.fast_mode_transcript_model
 
-        transcript = await run_in_thread(
-            get_video_transcript, video_path, speech_model, source_url
+        if not (
+            progress_callback
+            and runtime_config.transcription_provider == "whisper"
+        ):
+            transcript = await run_in_thread(
+                get_video_transcript, video_path, speech_model, source_url
+            )
+            logger.info(f"Transcript generated: {len(transcript)} characters")
+            return transcript
+
+        stop_event = threading.Event()
+        bridge = _WhisperProgressBridge(
+            asyncio.get_running_loop(), progress_callback, stop_event
         )
+        operation = asyncio.ensure_future(
+            run_in_thread(
+                get_video_transcript,
+                video_path,
+                speech_model,
+                source_url,
+                whisper_options={
+                    "on_progress": bridge.on_progress,
+                    "on_waiting": bridge.on_waiting,
+                    "cancel_event": stop_event,
+                    "task_id": task_id,
+                },
+            )
+        )
+        try:
+            transcript = await asyncio.shield(operation)
+        except asyncio.CancelledError:
+            # A thread cannot be killed: ask Whisper to stop at its next window
+            # (it holds the shared lock until then) and wait for it to unwind.
+            stop_event.set()
+            while not operation.done():
+                try:
+                    await asyncio.shield(operation)
+                except asyncio.CancelledError:
+                    continue
+                except BaseException:
+                    break
+            if not operation.cancelled():
+                operation.exception()
+            raise
+        except TranscriptionAborted:
+            if bridge.user_cancelled:
+                raise Exception("Task cancelled") from None
+            raise
         logger.info(f"Transcript generated: {len(transcript)} characters")
         return transcript
 
@@ -284,16 +448,44 @@ class VideoService:
         transcript: str,
         clip_signals: Optional[str] = None,
         performance_context: Optional[str] = None,
+        *,
+        progress_callback: Optional[Callable[..., Awaitable[None]]] = None,
     ) -> Any:
         """
         Analyze transcript with AI to find relevant segments.
         This is already async, no need to wrap.
+
+        Long transcripts are analysed in windows; ``progress_callback`` then
+        reports each finished window (short ones run as a single call).
         """
         logger.info("Starting AI analysis of transcript")
+        window_progress = {}
+        if progress_callback:
+            started = time.monotonic()
+
+            async def on_window_done(done: int, total: int) -> None:
+                elapsed = time.monotonic() - started
+                detail = {
+                    "stage": "analyze",
+                    "stage_progress": round(done / total * 100, 1),
+                    "elapsed_seconds": round(elapsed),
+                    "tick": True,
+                }
+                if done < total:
+                    detail["eta_seconds"] = round(elapsed / done * (total - done))
+                await progress_callback(
+                    ANALYZE_PROGRESS_START + int(ANALYZE_PROGRESS_SPAN * done / total),
+                    f"Analyzing content with AI — window {done}/{total}",
+                    "processing",
+                    detail=detail,
+                )
+
+            window_progress = {"on_window_done": on_window_done}
         relevant_parts = await get_most_relevant_parts_by_transcript(
             transcript,
             clip_signals=clip_signals,
             performance_context=performance_context,
+            **window_progress,
         )
         logger.info(
             f"AI analysis complete: {len(relevant_parts.most_relevant_segments)} segments found"
@@ -546,7 +738,10 @@ class VideoService:
                 raise Exception("Task cancelled")
 
             if progress_callback:
-                await progress_callback(10, "Downloading video...", "processing")
+                await progress_callback(
+                    10, "Downloading video...", "processing",
+                    detail={"stage": "download"},
+                )
 
             if source_type == "youtube":
                 video_info = await async_get_youtube_video_info(url, task_id=task_id)
@@ -640,7 +835,10 @@ class VideoService:
                 raise Exception("Task cancelled")
 
             if progress_callback:
-                await progress_callback(30, "Generating transcript...", "processing")
+                await progress_callback(
+                    30, "Generating transcript...", "processing",
+                    detail={"stage": "transcribe", "stage_progress": 0},
+                )
 
             transcript = cached_transcript
             # Database text alone cannot recreate timed captions or cleanup.
@@ -651,10 +849,18 @@ class VideoService:
                 and not (load_cached_transcript_data(video_path) or {}).get("words")
             )
             if not transcript or needs_word_timings:
+                # Live progress is an extra: stubs of generate_transcript keep
+                # working when there is nothing to report to.
+                live_progress = (
+                    {"task_id": task_id, "progress_callback": progress_callback}
+                    if progress_callback
+                    else {}
+                )
                 transcript = await VideoService.generate_transcript(
                     video_path,
                     processing_mode=processing_mode,
                     source_url=url if source_type == "youtube" else None,
+                    **live_progress,
                 )
 
             # Preserve paid word timings before any analysis/cancellation path.
@@ -670,7 +876,8 @@ class VideoService:
 
             if progress_callback:
                 await progress_callback(
-                    50, "Analyzing content with AI...", "processing"
+                    50, "Analyzing content with AI...", "processing",
+                    detail={"stage": "analyze", "stage_progress": 0},
                 )
 
             relevant_parts = None
@@ -716,6 +923,7 @@ class VideoService:
                     transcript,
                     clip_signals=clip_signals,
                     performance_context=performance_context,
+                    **({"progress_callback": progress_callback} if progress_callback else {}),
                 )
 
             # Step 4: Create clips
@@ -795,7 +1003,8 @@ class VideoService:
                 audio_path = video_path
                 if progress_callback:
                     await progress_callback(
-                        65, "Downloading selected segments...", "processing"
+                        65, "Downloading selected segments...", "processing",
+                        detail={"stage": "download"},
                     )
                 try:
                     if source_type in {"twitch", "kick"}:

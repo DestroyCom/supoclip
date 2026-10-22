@@ -1,22 +1,61 @@
 "use client";
 
-import { useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 
-type ProgressEvent = { progress?: number; message?: string; status?: string };
+/** Optional sub-progress; older backends only send progress/message/status. */
+export type ProgressEvent = {
+  progress?: number;
+  message?: string;
+  status?: string;
+  ts?: number;
+  stage?: string;
+  stage_progress?: number;
+  eta_seconds?: number | null;
+  elapsed_seconds?: number;
+  waiting?: boolean;
+};
+
+export type ProgressSource = "sse" | "db";
+
+const TERMINAL = ["completed", "cancelled", "error"];
 
 /** SSE is the fast path; reconciliation also recovers missed terminal events. */
 export function useTaskProgress<T>({ taskId, active, refresh, onProgress, onClip }: {
   taskId: string;
   active: boolean;
   refresh: () => Promise<unknown>;
-  onProgress: (event: ProgressEvent) => void;
+  onProgress: (event: ProgressEvent, source: ProgressSource) => void;
   onClip: (clip: T) => void;
 }) {
   const callbacks = useRef({ refresh, onProgress, onClip });
   callbacks.current = { refresh, onProgress, onClip };
   const [reconnecting, setReconnecting] = useState(false);
+  // What the UI currently shows, so slower sources cannot move it backwards.
+  const shown = useRef<{ progress: number; ts: number; sse: boolean }>({ progress: 0, ts: 0, sse: false });
+
+  /**
+   * Single entry point for progress. Live events win by timestamp; the database
+   * snapshot (older, coarser) only applies when it is ahead of what is shown, or
+   * when no live event has arrived yet.
+   */
+  const ingest = useCallback((event: ProgressEvent, source: ProgressSource) => {
+    const terminal = TERMINAL.includes(event.status ?? "");
+    const state = shown.current;
+    // Only Redis-published events carry a timestamp. Database snapshots (polling,
+    // or the one the stream sends on every reconnect) have none.
+    if (source === "sse" && typeof event.ts === "number") {
+      if (event.ts < state.ts) return;
+      state.ts = event.ts;
+      state.sse = true;
+    } else if (!terminal && state.sse && !((event.progress ?? 0) > state.progress)) {
+      return;
+    }
+    if (typeof event.progress === "number") state.progress = event.progress;
+    callbacks.current.onProgress(event, source);
+  }, []);
 
   useEffect(() => {
+    shown.current = { progress: 0, ts: 0, sse: false };
     if (!active || !taskId) {
       setReconnecting(false);
       return;
@@ -46,8 +85,8 @@ export function useTaskProgress<T>({ taskId, active, refresh, onProgress, onClip
     const progress = (event: Event) => {
       const data = read(event);
       if (!data) return;
-      callbacks.current.onProgress(data);
-      if (["completed", "cancelled", "error"].includes(data.status)) void reconcile();
+      ingest(data, "sse");
+      if (TERMINAL.includes(data.status)) void reconcile();
     };
     source.addEventListener("status", progress);
     source.addEventListener("progress", progress);
@@ -70,6 +109,6 @@ export function useTaskProgress<T>({ taskId, active, refresh, onProgress, onClip
       document.removeEventListener("visibilitychange", onVisible);
       window.removeEventListener("online", onVisible);
     };
-  }, [taskId, active]);
-  return { reconnecting };
+  }, [taskId, active, ingest]);
+  return { reconnecting, ingest };
 }

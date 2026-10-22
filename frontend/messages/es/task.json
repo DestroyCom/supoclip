@@ -120,6 +120,10 @@
   "clipsReady": "{count, plural, one {# clip listo abajo — vienen más.} other {# clips listos abajo — vienen más.}}",
   "grabCoffee": "Tómate un café — los clips aparecen aquí en cuanto se renderizan.",
   "percentComplete": "{progress}% completo",
+  "elapsed": "{time} transcurridos",
+  "etaLeft": "faltan unos {time}",
+  "stageProgress": "{percent}% de este paso",
+  "failedStage": "Falló durante: {step}",
   "transcript": {
     "heading": "Transcripción",
     "seeMore": "Ver más",

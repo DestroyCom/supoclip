@@ -3,7 +3,7 @@ AI-related functions for transcript analysis with enhanced precision and viralit
 """
 
 from pathlib import Path
-from typing import List, Dict, Any, Optional, Literal
+from typing import Awaitable, Callable, List, Dict, Any, Optional, Literal
 import asyncio
 import logging
 import math
@@ -30,7 +30,7 @@ IDEAL_CLIP_MIN_SECONDS = 25
 IDEAL_CLIP_MAX_SECONDS = 50
 MIN_ACCEPTED_CLIP_SECONDS = 15
 MAX_ACCEPTED_CLIP_SECONDS = 60
-TRANSCRIPT_ANALYSIS_CACHE_VERSION = "windowed-rerank-v6"
+TRANSCRIPT_ANALYSIS_CACHE_VERSION = "windowed-rerank-v7"
 TRANSCRIPT_ANALYSIS_MAX_ATTEMPTS = 3
 TRANSCRIPT_ANALYSIS_TIMEOUT_SECONDS = 600
 # Long transcripts are analysed in overlapping windows so every part of the
@@ -711,6 +711,45 @@ def build_candidate_rerank_prompt(
     )
 
 
+_LANGUAGE_NAMES = {
+    "fr": "French",
+    "en": "English",
+    "es": "Spanish",
+    "de": "German",
+    "pt": "Portuguese",
+    "it": "Italian",
+    "nl": "Dutch",
+    "zh": "Chinese",
+    "ja": "Japanese",
+    "ko": "Korean",
+    "ru": "Russian",
+    "hi": "Hindi",
+}
+
+
+def _language_directive() -> str:
+    """Tell the model which language to write titles and notes in.
+
+    The prompt itself is English, so without this the model tends to answer in
+    English even for a French transcript.
+    """
+    code = (get_config().transcription_language or "").split("_", 1)[0]
+    if not code:
+        return (
+            "Write hook_title, reasoning, summary and key_topics in the same language as "
+            "the transcript text, even though these instructions are in English. "
+            "Never translate them to English."
+        )
+    name = _LANGUAGE_NAMES.get(code, code)
+    directive = (
+        f"The transcript is in {name} ({code}). Write hook_title, reasoning, summary and "
+        f"key_topics in {name}. Never translate them to English."
+    )
+    if code == "fr":
+        directive += ' Example hook_title: "L\'erreur à 40 000 € que je vois partout".'
+    return directive
+
+
 def build_transcript_analysis_prompt(
     transcript: str,
     include_broll: bool = False,
@@ -784,6 +823,7 @@ JSON-only output requirements:
 - Segment keys: "start_time", "end_time", "text", "relevance_score", "reasoning", "virality", "hook_title".
 - Optional segment keys "hook_start_time"/"hook_end_time": null unless a later 2-5 second line stands alone and the real opening is already a complete setup. The clip is not replayed from that line by default.
 - "hook_title" is a 3-9 word plain-text headline for the clip, in the transcript's language, grounded in the segment (no hashtags, emojis, or quotes).
+- Language: {_language_directive()}
 - Virality keys: "hook_score", "engagement_score", "value_score", "shareability_score", "total_score", "hook_type", "virality_reasoning".
 - Do not return segments shorter than {MIN_ACCEPTED_CLIP_SECONDS} seconds or longer than {MAX_ACCEPTED_CLIP_SECONDS} seconds.
 
@@ -1319,12 +1359,15 @@ async def _analyze_transcript_windows(
     include_broll: bool,
     clip_signals: Optional[str],
     performance_context: Optional[str] = None,
+    on_window_done: Optional[Callable[[int, int], Awaitable[None]]] = None,
 ) -> List[TranscriptAnalysis]:
     """Analyse windows with bounded concurrency, tolerating some failures.
 
     Raises the first window error only when no window produced an analysis.
+    ``on_window_done(finished, total)`` runs as each window ends, failed or not.
     """
     semaphore = asyncio.Semaphore(ANALYSIS_WINDOW_CONCURRENCY)
+    finished = 0
 
     async def run_window(window: Dict[str, Any]) -> TranscriptAnalysis:
         async with semaphore:
@@ -1337,8 +1380,17 @@ async def _analyze_transcript_windows(
                 window=(window["start"], window["end"]),
                 performance_context=performance_context,
             )
-            result = await _run_transcript_analysis(agent, prompt)
-            return result.output
+            try:
+                result = await _run_transcript_analysis(agent, prompt)
+                return result.output
+            finally:
+                nonlocal finished
+                finished += 1
+                if on_window_done is not None:
+                    try:
+                        await on_window_done(finished, len(windows))
+                    except Exception:
+                        logger.debug("Window progress callback failed", exc_info=True)
 
     tasks = [asyncio.create_task(run_window(window)) for window in windows]
     try:
@@ -1549,6 +1601,7 @@ async def get_most_relevant_parts_by_transcript(
     include_broll: bool = False,
     clip_signals: str | None = None,
     performance_context: str | None = None,
+    on_window_done: Callable[[int, int], Awaitable[None]] | None = None,
 ) -> TranscriptAnalysis:
     """Get the most relevant parts of a transcript with virality scoring and optional B-roll detection.
 
@@ -1580,7 +1633,8 @@ async def get_most_relevant_parts_by_transcript(
         else:
             logger.info("Analysing transcript in %d overlapping windows", len(windows))
             analyses = await _analyze_transcript_windows(
-                agent, windows, include_broll, clip_signals, performance_context
+                agent, windows, include_broll, clip_signals, performance_context,
+                on_window_done=on_window_done,
             )
 
         candidates: List[TranscriptSegment] = []

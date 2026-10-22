@@ -620,7 +620,7 @@ async def test_failure_notification_error_preserves_render_failure(tmp_path):
     service.config.temp_dir = str(tmp_path)
     service.video_service.create_single_clip = AsyncMock(return_value=None)
 
-    async def notify(progress, message, status):
+    async def notify(progress, message, status, detail=None):
         if status == "error":
             raise RuntimeError("Redis unavailable")
 
@@ -727,3 +727,57 @@ async def test_personalized_run_is_not_reported_as_a_cache_hit():
     )
     await service.process_task(task_id="task-1", url="upload://test.mp4", source_type="upload", user_id="user-1")
     assert service.task_repo.update_task_runtime_metadata.await_args_list[0].kwargs["cache_hit"] is True
+
+
+@pytest.mark.asyncio
+async def test_render_progress_counts_clips_and_estimates_time_left(tmp_path):
+    service = build_task_service()
+    service.config.temp_dir = str(tmp_path)
+    service.video_service.process_video_complete.return_value["segments_to_render"] *= 2
+    callback = AsyncMock()
+
+    await service.process_task(
+        task_id="task-1", url="upload://source.mp4", source_type="video_url",
+        progress_callback=callback,
+    )
+
+    renders = [
+        call for call in callback.await_args_list
+        if call.kwargs.get("detail", {}).get("stage") == "render"
+    ]
+    starts = [call for call in renders if call.args[1].startswith("Creating clip")]
+    assert [call.args[1] for call in starts] == ["Creating clip 1/2...", "Creating clip 2/2..."]
+    assert starts[0].kwargs["detail"]["stage_progress"] == 0
+    assert starts[1].kwargs["detail"]["stage_progress"] == 50.0
+    assert "eta_seconds" in starts[1].kwargs["detail"]
+    # One clip finished with one to go: a tick refreshes the clock.
+    ticks = [call for call in renders if call.args[1] == "Clip 1/2 ready"]
+    assert len(ticks) == 1 and ticks[0].kwargs["detail"]["tick"] is True
+
+
+@pytest.mark.asyncio
+async def test_failure_records_stage_and_truncates_message(tmp_path):
+    service = build_task_service()
+    service.config.temp_dir = str(tmp_path)
+    long_error = "boom " * 100
+
+    async def failing_pipeline(**kwargs):
+        await kwargs["progress_callback"](
+            30, "Generating transcript...", "processing", detail={"stage": "transcribe"}
+        )
+        raise RuntimeError(long_error)
+
+    service.video_service.process_video_complete = AsyncMock(side_effect=failing_pipeline)
+    callback = AsyncMock()
+
+    with pytest.raises(RuntimeError):
+        await service.process_task(
+            task_id="task-1", url="upload://source.mp4", source_type="video_url",
+            progress_callback=callback,
+        )
+
+    shown = service.task_repo.update_task_status.await_args.kwargs["progress_message"]
+    assert len(shown) == task_service_module.ERROR_MESSAGE_MAX_CHARS
+    assert shown.endswith("…") and long_error.startswith(shown[:-1])
+    assert service.task_repo.update_task_runtime_metadata.await_args.kwargs["error_code"] == "transcription_error"
+    callback.assert_any_await(0, shown, "error")

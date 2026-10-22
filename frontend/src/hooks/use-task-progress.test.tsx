@@ -38,6 +38,32 @@ describe("generation progress recovery", () => {
     unmount();
   });
 
+  it("never lets the database snapshot move a live task backwards", async () => {
+    const onProgress = vi.fn();
+    const { result, unmount } = renderHook(() => useTaskProgress({ taskId: "one", active: true, refresh: vi.fn().mockResolvedValue(true), onProgress, onClip: vi.fn() }));
+    const source = FakeEventSource.instances[0];
+    const live = (ts: number, progress: number, message: string) => act(() => source.emit("progress", { progress, message, status: "processing", ts, stage: "transcribe" }));
+
+    // Old backends send no timestamps: everything is applied, as before.
+    act(() => { result.current.ingest({ progress: 30, message: "Generating transcript...", status: "processing" }, "db"); });
+    expect(onProgress).toHaveBeenLastCalledWith(expect.objectContaining({ progress: 30 }), "db");
+
+    live(2000, 38, "Transcribing 40%");
+    live(1000, 33, "Transcribing 15% (arrived late)");
+    expect(onProgress).toHaveBeenLastCalledWith(expect.objectContaining({ message: "Transcribing 40%" }), "sse");
+
+    // A stale snapshot, and the one the stream replays after a reconnect, are dropped...
+    act(() => { result.current.ingest({ progress: 38, message: "Transcribing 30% (10 s ago)", status: "processing" }, "db"); });
+    act(() => { source.emit("status", { progress: 30, message: "Generating transcript...", status: "processing" }); });
+    expect(onProgress).toHaveBeenCalledTimes(2);
+    // ...a snapshot that is ahead, or a terminal one, is not.
+    act(() => { result.current.ingest({ progress: 50, message: "Analyzing content with AI...", status: "processing" }, "db"); });
+    expect(onProgress).toHaveBeenLastCalledWith(expect.objectContaining({ progress: 50 }), "db");
+    act(() => { result.current.ingest({ progress: 0, message: "boom", status: "error" }, "db"); });
+    expect(onProgress).toHaveBeenLastCalledWith(expect.objectContaining({ status: "error" }), "db");
+    unmount();
+  });
+
   it("recovers malformed events and never overlaps background requests", async () => {
     let resolve!: () => void;
     const refresh = vi.fn(() => new Promise<void>((done) => { resolve = done; }));

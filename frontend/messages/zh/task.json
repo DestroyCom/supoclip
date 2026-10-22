@@ -120,6 +120,10 @@
   "clipsReady": "{count, plural, one {下方已有 # 个片段——还有更多在路上。} other {下方已有 # 个片段——还有更多在路上。}}",
   "grabCoffee": "先去倒杯咖啡——片段一渲染完就会出现在这里。",
   "percentComplete": "已完成 {progress}%",
+  "elapsed": "已用时 {time}",
+  "etaLeft": "还需约 {time}",
+  "stageProgress": "本步骤已完成 {percent}%",
+  "failedStage": "失败步骤：{step}",
   "transcript": {
     "heading": "文稿",
     "seeMore": "查看更多",

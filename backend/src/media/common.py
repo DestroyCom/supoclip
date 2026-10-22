@@ -20,6 +20,8 @@ import shutil
 
 import subprocess
 
+import threading
+
 import tempfile
 
 import time
@@ -128,6 +130,10 @@ ANALYSIS_UTTERANCE_SPLIT_THRESHOLD_MS = 45_000
 ANALYSIS_UTTERANCE_SPLIT_THRESHOLD_WORDS = 80
 
 _WHISPER_MODEL_CACHE: Dict[str, Any] = {}
+
+# Cached models are shared by every job thread, but Whisper's KV-cache hooks
+# live on the shared layers, so concurrent transcribe() calls corrupt each other.
+_WHISPER_TRANSCRIBE_LOCK = threading.Lock()
 
 FINAL_VIDEO_CRF = 19
 
