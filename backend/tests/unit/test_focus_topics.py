@@ -67,6 +67,7 @@ def test_focus_topics_are_injected_into_analysis_prompt():
     assert "- événement pour les fans" in prompt
     assert "- concert" in prompt
     assert "Match by meaning, not exact words" in prompt
+    assert "different language than the transcript" in prompt
     assert "empty most_relevant_segments list" in prompt
     assert "Choose 2-5 segments total." not in prompt
     assert "only from the focus topics" in prompt
