@@ -232,3 +232,40 @@ def test_reuse_propagates_a_stop_request_from_the_progress_hook(video):
 
     with pytest.raises(transcription.TranscriptionAborted):
         _get_transcript_with_whisper(video, make_config(), on_progress=stop)
+
+
+def test_force_rerun_transcribes_again_despite_a_matching_cache(video, monkeypatch):
+    write_cache(video)
+    calls = []
+
+    def fake_whisper(*args, **kwargs):
+        calls.append(kwargs)
+        return WHISPER_RESULT
+
+    monkeypatch.setattr(transcription, "transcribe_with_whisper", fake_whisper)
+    monkeypatch.setattr(
+        transcription,
+        "get_config",
+        lambda: make_config(transcription_provider="whisper"),
+    )
+
+    transcription.get_video_transcript(video, reuse_cache=False)
+
+    assert len(calls) == 1
+    assert "reuse_cache" not in calls[0]
+
+
+def test_whisper_reuse_is_still_the_default(video, monkeypatch):
+    write_cache(video)
+    monkeypatch.setattr(
+        transcription,
+        "transcribe_with_whisper",
+        lambda *_a, **_k: pytest.fail("Whisper must not run"),
+    )
+    monkeypatch.setattr(
+        transcription,
+        "get_config",
+        lambda: make_config(transcription_provider="whisper"),
+    )
+
+    assert transcription.get_video_transcript(video).startswith("[00:00 - 00:12]")

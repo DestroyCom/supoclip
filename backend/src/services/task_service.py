@@ -327,6 +327,7 @@ class TaskService(ClipEditingMixin):
         clip_ready_callback: Optional[Callable] = None,
         cleanup_settings: Optional[Dict[str, Any]] = None,
         focus_topics: Optional[List[str]] = None,
+        force_rerun: bool = False,
     ) -> Dict[str, Any]:
         """
         Process a task: download video, analyze, create clips.
@@ -362,7 +363,12 @@ class TaskService(ClipEditingMixin):
                 url, source_type, processing_mode, download_quality
             )
 
-            cache_entry = await self.cache_repo.get_cache(self.db, cache_key)
+            # Total rerun skips every stored result; the fresh ones replace them.
+            cache_entry = (
+                None
+                if force_rerun
+                else await self.cache_repo.get_cache(self.db, cache_key)
+            )
             cached_transcript = (
                 cache_entry.get("transcript_text") if cache_entry else None
             )
@@ -458,6 +464,7 @@ class TaskService(ClipEditingMixin):
                 should_cancel=should_cancel,
                 performance_context=performance_context,
                 **({"focus_topics": focus_topics} if focus_topics else {}),
+                **({"force_rerun": True} if force_rerun else {}),
             )
             stage_timings["pipeline_seconds"] = round(
                 perf_counter() - pipeline_start, 3

@@ -68,6 +68,8 @@
   },
   "captions": "Untertitel",
   "noCaptions": "Keine Untertitel",
+  "forceRerun": "Alles neu ausführen",
+  "forceRerunHint": "Alles Gespeicherte zu diesem Video ignorieren: erneut herunterladen, transkribieren und analysieren. Langsamer und verbraucht Transkriptions-Guthaben.",
   "cleanup": "Bereinigung",
   "cleanupTitle": "Clip-Bereinigung",
   "cleanupBody": "Kürzt Leerlauf und schneidet Fülllaute beim Rendern heraus.",

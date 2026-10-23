@@ -68,6 +68,8 @@
   },
   "captions": "Captions",
   "noCaptions": "No captions",
+  "forceRerun": "Force total rerun",
+  "forceRerunHint": "Ignore everything saved for this video: download, transcribe and analyze it again. Slower, and it uses transcription credits.",
   "cleanup": "Cleanup",
   "cleanupTitle": "Clip cleanup",
   "cleanupBody": "Tighten dead air and cut filler sounds while rendering.",

@@ -68,6 +68,8 @@
   },
   "captions": "Legendas",
   "noCaptions": "Sem legendas",
+  "forceRerun": "Forçar reexecução total",
+  "forceRerunHint": "Ignora tudo o que foi guardado deste vídeo: baixa, transcreve e analisa novamente. É mais lento e usa créditos de transcrição.",
   "cleanup": "Limpeza",
   "cleanupTitle": "Limpeza do clipe",
   "cleanupBody": "Encurta os silêncios e corta sons de preenchimento na renderização.",

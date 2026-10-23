@@ -881,6 +881,34 @@ def cached_full_media(video_id: str) -> Optional[Path]:
         return _full_path(directory, _load_manifest(directory, video_id))
 
 
+def purge_youtube_cache(video_id: str) -> None:
+    """Forget every stored download for a video so the next job fetches it afresh."""
+    runtime = get_config()
+    directory = cache_dir_for(video_id, runtime)
+    if directory.exists():
+        with _cache_lock(directory):
+            for child in directory.iterdir():
+                if child.name == ".lock":
+                    continue
+                if child.is_dir():
+                    shutil.rmtree(child, ignore_errors=True)
+                else:
+                    child.unlink(missing_ok=True)
+    storage = _storage()
+    if storage is None:
+        return
+    try:
+        storage.delete(
+            storage.reference(storage.key(CACHE_DIRNAME, video_id)), prefix=True
+        )
+    except Exception as exc:
+        logger.warning(
+            "Could not purge remote YouTube cache for %s: %s",
+            video_id,
+            redact_secrets(str(exc)),
+        )
+
+
 def resolve_full_youtube_download(
     url: str,
     video_id: str,

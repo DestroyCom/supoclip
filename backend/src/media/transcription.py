@@ -456,6 +456,7 @@ def get_video_transcript(
     source_url: Optional[str] = None,
     *,
     whisper_options: Optional[Dict[str, Any]] = None,
+    reuse_cache: bool = True,
 ) -> str:
     """Get a video transcript using the configured provider.
 
@@ -463,15 +464,18 @@ def get_video_transcript(
     ``TRANSCRIPTION_PROVIDER``. ``source_url`` enables the youtube_captions
     provider, which needs the original URL rather than a local file path.
     ``whisper_options`` (progress/cancel hooks) only applies to Whisper.
+    ``reuse_cache=False`` makes Whisper transcribe again instead of reusing a
+    matching transcript cache.
     """
     logger.info(f"Getting transcript for: {video_path}")
     runtime_config = get_config()
     provider = runtime_config.transcription_provider
 
     if provider == "whisper":
-        return _get_transcript_with_whisper(
-            video_path, runtime_config, **(whisper_options or {})
-        )
+        options = dict(whisper_options or {})
+        if not reuse_cache:
+            options["reuse_cache"] = False
+        return _get_transcript_with_whisper(video_path, runtime_config, **options)
     if provider == "youtube_captions":
         if not source_url:
             raise ValueError(
@@ -671,7 +675,12 @@ def load_reusable_whisper_transcript(video_path: Path, runtime_config) -> Option
 
 def _get_transcript_with_whisper(video_path: Path, runtime_config, **options) -> str:
     """Get transcript using local Whisper with word-level timestamps."""
-    reused = load_reusable_whisper_transcript(video_path, runtime_config)
+    reuse_cache = options.pop("reuse_cache", True)
+    reused = (
+        load_reusable_whisper_transcript(video_path, runtime_config)
+        if reuse_cache
+        else None
+    )
     if reused is not None:
         # Nothing runs, so report the stage as done instead of leaving it at 0%.
         on_progress = options.get("on_progress")

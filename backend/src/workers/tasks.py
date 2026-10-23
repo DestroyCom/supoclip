@@ -33,6 +33,7 @@ async def process_video_task(
     add_subtitles: bool = True,
     cleanup_settings: Dict[str, Any] | None = None,
     focus_topics: List[str] | None = None,
+    force_rerun: bool = False,
 ) -> Dict[str, Any]:
     """
     Background worker task to process a video.
@@ -104,6 +105,7 @@ async def process_video_task(
                 clip_ready_callback=clip_ready_callback,
                 cleanup_settings=cleanup_settings,
                 **({"focus_topics": focus_topics} if focus_topics else {}),
+                **({"force_rerun": True} if force_rerun else {}),
             )
 
             logger.info(f"Task {task_id} completed successfully")
