@@ -448,6 +448,7 @@ class VideoService:
         transcript: str,
         clip_signals: Optional[str] = None,
         performance_context: Optional[str] = None,
+        focus_topics: Optional[List[str]] = None,
         *,
         progress_callback: Optional[Callable[..., Awaitable[None]]] = None,
     ) -> Any:
@@ -485,6 +486,7 @@ class VideoService:
             transcript,
             clip_signals=clip_signals,
             performance_context=performance_context,
+            focus_topics=focus_topics,
             **window_progress,
         )
         logger.info(
@@ -716,6 +718,7 @@ class VideoService:
         progress_callback: Optional[Callable[[int, str, str], Awaitable[None]]] = None,
         should_cancel: Optional[Callable[[], Awaitable[bool]]] = None,
         performance_context: Optional[str] = None,
+        focus_topics: Optional[List[str]] = None,
     ) -> Dict[str, Any]:
         """
         Complete video processing pipeline.
@@ -924,6 +927,7 @@ class VideoService:
                     clip_signals=clip_signals,
                     performance_context=performance_context,
                     **({"progress_callback": progress_callback} if progress_callback else {}),
+                    **({"focus_topics": focus_topics} if focus_topics else {}),
                 )
 
             # Step 4: Create clips

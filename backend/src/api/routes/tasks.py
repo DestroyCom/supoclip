@@ -13,7 +13,7 @@ from pathlib import Path
 from contextlib import aclosing
 import json
 import logging
-from typing import Dict, Any, Optional
+from typing import Dict, Any, List, Optional
 import inspect
 import re
 import secrets
@@ -46,6 +46,7 @@ from ...clip_cleanup import (
     normalize_clip_cleanup_settings,
     updated_cleanup_settings,
 )
+from ...focus_topics import normalize_focus_topics
 from ...video_utils import VALID_OUTPUT_FORMATS
 from ...admin_auth import require_admin_user, user_is_admin
 import redis.asyncio as redis
@@ -271,6 +272,7 @@ def _merge_task_source_metadata(
     output_format: Any = None,
     add_subtitles: Any = None,
     cleanup_settings: Dict[str, Any] | None = None,
+    focus_topics: List[str] | None = None,
 ) -> Dict[str, Any]:
     merged = dict(existing or {})
 
@@ -284,6 +286,8 @@ def _merge_task_source_metadata(
         merged["add_subtitles"] = add_subtitles
     if cleanup_settings:
         merged.update(cleanup_settings)
+    if focus_topics:
+        merged["focus_topics"] = focus_topics
 
     return merged
 
@@ -428,6 +432,7 @@ async def create_task(request: Request, db: AsyncSession = Depends(get_db)):
     if not isinstance(add_subtitles, bool):
         add_subtitles = True
     cleanup_settings = new_task_cleanup_settings(data)
+    focus_topics = normalize_focus_topics(data.get("focus_topics"))
     if not raw_source or not raw_source.get("url"):
         raise HTTPException(status_code=400, detail="Source URL is required")
 
@@ -495,6 +500,7 @@ async def create_task(request: Request, db: AsyncSession = Depends(get_db)):
                         output_format=output_format,
                         add_subtitles=add_subtitles,
                         cleanup_settings=cleanup_settings,
+                        focus_topics=focus_topics,
                     ),
                     db=db,
                 )
@@ -517,6 +523,7 @@ async def create_task(request: Request, db: AsyncSession = Depends(get_db)):
                     add_subtitles,
                     cleanup_settings,
                     _job_id=processing_job_id,
+                    **({"focus_topics": focus_topics} if focus_topics else {}),
                 )
 
             except Exception:
@@ -1286,6 +1293,7 @@ async def resume_task(
                 metadata.get("remove_filler_words"),
                 metadata.get("filtered_words"),
             )
+            focus_topics = normalize_focus_topics(metadata.get("focus_topics"))
 
             if not source_url or not source_type:
                 raise HTTPException(status_code=400, detail="Task source URL is missing")
@@ -1339,6 +1347,7 @@ async def resume_task(
                         add_subtitles,
                         cleanup_settings,
                         _job_id=processing_job_id,
+                        **({"focus_topics": focus_topics} if focus_topics else {}),
                     )
                 except Exception:
                     await task_service.task_repo.update_task_status(
