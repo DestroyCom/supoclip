@@ -35,9 +35,16 @@ from .common import (
 WHISPER_SECONDS_PER_FRAME = 0.01
 WHISPER_LOCK_POLL_SECONDS = 5.0
 from .ffmpeg import (
+    ffprobe_duration,
     run_ffmpeg_command,
     select_audio_stream_index,
 )
+
+# A reused transcript must cover the source: its last word may end this early
+# (fraction of the source duration) or this late (seconds past it).
+LEGACY_CACHE_MIN_COVERAGE = 0.95
+LEGACY_CACHE_MAX_OVERRUN_SECONDS = 30.0
+CACHE_DURATION_TOLERANCE_SECONDS = 1.0
 
 
 def _prepare_audio_for_transcription(video_path: Path) -> Path:
@@ -545,8 +552,139 @@ def _get_transcript_with_assemblyai(
         client.http_client.close()
 
 
+def _safe_media_duration(video_path: Path) -> Optional[float]:
+    try:
+        return ffprobe_duration(video_path)
+    except Exception as exc:
+        logger.debug("Could not probe duration of %s: %s", video_path, exc)
+        return None
+
+
+def _whisper_cache_meta(video_path: Path, runtime_config) -> Dict[str, Any]:
+    """What a Whisper transcript was made from, stored next to its words."""
+    meta: Dict[str, Any] = {
+        "provider": "whisper",
+        "whisper_model": runtime_config.whisper_model,
+        "requested_language": runtime_config.transcription_language or "",
+    }
+    try:
+        meta["source_size"] = video_path.stat().st_size
+    except OSError:
+        pass
+    duration = _safe_media_duration(video_path)
+    if duration is not None:
+        meta["source_duration"] = round(duration, 3)
+    return meta
+
+
+def load_reusable_whisper_transcript(video_path: Path, runtime_config) -> Optional[str]:
+    """Rebuild the analysis transcript from a cache written by a Whisper run.
+
+    Returns the same text a fresh Whisper run would, or ``None`` when the cache
+    is missing, empty, or not provably for this source, model and language.
+    A cache from before model/language were recorded is only trusted with
+    ``TRANSCRIPT_CACHE_TRUST_LEGACY`` and a plausible coverage of the source.
+    """
+    payload = load_cached_transcript_data(video_path)
+    if not payload:
+        return None
+    words = payload.get("words") or []
+    utterances = payload.get("utterances") or []
+    if not words or not utterances:
+        return None
+    if payload.get("version") != TRANSCRIPT_CACHE_SCHEMA_VERSION:
+        logger.info("Transcript cache ignored: schema version %s", payload.get("version"))
+        return None
+
+    duration = _safe_media_duration(video_path)
+    requested = runtime_config.transcription_language or ""
+
+    if payload.get("provider") is None:
+        if not runtime_config.transcript_cache_trust_legacy:
+            logger.info(
+                "Transcript cache for %s has no model/language metadata; "
+                "set TRANSCRIPT_CACHE_TRUST_LEGACY=true to reuse it",
+                video_path.name,
+            )
+            return None
+        if any(u.get("speaker") for u in utterances):
+            logger.warning("Legacy transcript cache ignored: speaker labels mean it is not from Whisper")
+            return None
+        detected = (payload.get("language_code") or "").split("_", 1)[0]
+        if requested and detected and requested.split("_", 1)[0] != detected:
+            logger.warning(
+                "Legacy transcript cache ignored: language %s, requested %s", detected, requested
+            )
+            return None
+        if not duration:
+            logger.warning("Legacy transcript cache ignored: source duration unavailable")
+            return None
+        last_end = max(int(w.get("end", 0)) for w in words) / 1000
+        if not (
+            LEGACY_CACHE_MIN_COVERAGE * duration
+            <= last_end
+            <= duration + LEGACY_CACHE_MAX_OVERRUN_SECONDS
+        ):
+            logger.warning(
+                "Legacy transcript cache ignored: last word ends at %.0fs but the source lasts %.0fs",
+                last_end,
+                duration,
+            )
+            return None
+        logger.warning(
+            "Reusing legacy transcript cache for %s (model %s not verified)",
+            video_path.name,
+            runtime_config.whisper_model,
+        )
+    else:
+        mismatch = None
+        if payload.get("provider") != "whisper":
+            mismatch = f"provider {payload.get('provider')}"
+        elif payload.get("whisper_model") != runtime_config.whisper_model:
+            mismatch = f"model {payload.get('whisper_model')}"
+        elif (payload.get("requested_language") or "") != requested:
+            mismatch = f"language {payload.get('requested_language') or 'auto'}"
+        elif (
+            payload.get("source_size") is not None
+            and payload["source_size"] != video_path.stat().st_size
+        ):
+            mismatch = "source size"
+        elif (
+            duration is not None
+            and payload.get("source_duration") is not None
+            and abs(payload["source_duration"] - duration) > CACHE_DURATION_TOLERANCE_SECONDS
+        ):
+            mismatch = "source duration"
+        if mismatch:
+            logger.info("Transcript cache ignored: different %s", mismatch)
+            return None
+
+    lines = [
+        _format_whisper_segment_line(
+            int(u.get("start", 0)), int(u.get("end", 0)), u.get("text", "")
+        )
+        for u in utterances
+    ]
+    logger.info("Reusing cached Whisper transcript: %d segments", len(lines))
+    return "\n".join(lines)
+
+
 def _get_transcript_with_whisper(video_path: Path, runtime_config, **options) -> str:
     """Get transcript using local Whisper with word-level timestamps."""
+    reused = load_reusable_whisper_transcript(video_path, runtime_config)
+    if reused is not None:
+        # Nothing runs, so report the stage as done instead of leaving it at 0%.
+        on_progress = options.get("on_progress")
+        if on_progress is not None:
+            total = _safe_media_duration(video_path) or 1.0
+            try:
+                on_progress(total, total, 0.0, 0.0)
+            except TranscriptionAborted:
+                raise
+            except Exception:
+                logger.debug("Whisper progress callback failed", exc_info=True)
+        return reused
+
     model_name = runtime_config.whisper_model
     whisper_result = transcribe_with_whisper(
         video_path,
@@ -556,7 +694,9 @@ def _get_transcript_with_whisper(video_path: Path, runtime_config, **options) ->
     )
 
     formatted_lines = format_transcript_for_analysis(whisper_result)
-    cache_transcript_data(video_path, whisper_result)
+    cache_transcript_data(
+        video_path, whisper_result, _whisper_cache_meta(video_path, runtime_config)
+    )
 
     result = "\n".join(formatted_lines)
     logger.info(
@@ -580,15 +720,19 @@ def _get_transcript_with_youtube_captions(source_url: str) -> str:
     return transcript
 
 
-def cache_transcript_data(video_path: Path, transcript) -> None:
+def cache_transcript_data(
+    video_path: Path, transcript, meta: Optional[Dict[str, Any]] = None
+) -> None:
     """Cache transcript data for subtitle generation.
 
     Handles both AssemblyAI transcript objects and Whisper result dicts.
+    ``meta`` (Whisper only) records what the transcript was made from.
     """
     cache_path = video_path.with_suffix(".transcript_cache.json")
 
     if isinstance(transcript, dict):
         cache_data = _whisper_result_to_transcript_data(transcript)
+        cache_data.update(meta or {})
         with open(cache_path, "w") as f:
             json.dump(cache_data, f)
         logger.info("Cached %d words to %s", len(cache_data["words"]), cache_path)
@@ -751,6 +895,10 @@ def _format_words_for_analysis(
     return formatted_lines
 
 
+def _format_whisper_segment_line(start_ms: int, end_ms: int, text: str) -> str:
+    return f"[{format_ms_to_timestamp(start_ms)} - {format_ms_to_timestamp(end_ms)}] {text.strip()}"
+
+
 def format_transcript_for_analysis(transcript) -> List[str]:
     """Format transcripts into readable timestamped segments for AI analysis.
 
@@ -762,11 +910,12 @@ def format_transcript_for_analysis(transcript) -> List[str]:
     if isinstance(transcript, dict):
         formatted_lines = []
         for segment in transcript.get("segments") or []:
-            start_ms = int(segment.get("start", 0) * 1000)
-            end_ms = int(segment.get("end", 0) * 1000)
             formatted_lines.append(
-                f"[{format_ms_to_timestamp(start_ms)} - {format_ms_to_timestamp(end_ms)}] "
-                f"{segment.get('text', '').strip()}"
+                _format_whisper_segment_line(
+                    int(segment.get("start", 0) * 1000),
+                    int(segment.get("end", 0) * 1000),
+                    segment.get("text", ""),
+                )
             )
         return formatted_lines
 

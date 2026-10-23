@@ -30,6 +30,11 @@ class Config:
         self.transcription_language = self._normalize_transcription_language(
             os.getenv("TRANSCRIPTION_LANGUAGE")
         )
+        # Reuse a Whisper transcript cache written before it recorded the model
+        # and language (checked against the source's duration instead).
+        self.transcript_cache_trust_legacy = self._get_bool_env(
+            "TRANSCRIPT_CACHE_TRUST_LEGACY", False
+        )
         self.llm = self._get_runtime_setting("LLM") or self._infer_default_llm()
         # Optional separate model for the cross-window candidate rerank pass.
         self.rerank_llm = self._get_optional_env("RERANK_LLM") or self.llm
