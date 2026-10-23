@@ -134,6 +134,7 @@ These settings affect clip generation speed, throughput, and defaults.
 | `FAST_MODE_TRANSCRIPT_MODEL` | `universal-3-5-pro` | Fast mode uses the Pro model too; `universal-2` covers languages Pro doesn't. `nano`/`universal-2` select the cheaper model for self-hosting |
 | `ASSEMBLY_AI_REQUEST_TIMEOUT_SECONDS` | `60` | Per-request upload/submit timeout (5–300). Transient upload failures retry up to 3 times; the paid submission is attempted once |
 | `WHISPER_MODEL_SIZE` | `medium` in `.env.example` | Whisper model size when Whisper is used locally |
+| `TRANSCRIPT_CACHE_TRUST_LEGACY` | `false` | Whisper reuses a saved `.transcript_cache.json` when it was made with the same model, language and source. Caches from before those were recorded are reused only when this is `true` and the last word ends between 95% of the source duration and 30 s past it |
 | `QUEUED_TASK_TIMEOUT_SECONDS` | `180` | Marks stale queued tasks as failed instead of leaving them stuck forever |
 | `MAX_VIDEO_DURATION` | `5400` | Maximum accepted upload length and baseline YouTube length in seconds |
 | `PRO_YOUTUBE_MAX_VIDEO_DURATION` | `5400` | Maximum YouTube length for active or trialing Pro subscriptions, in seconds |
