@@ -3,7 +3,7 @@ Worker tasks - background jobs processed by arq workers.
 """
 
 import logging
-from typing import Dict, Any, Optional
+from typing import Dict, Any, List, Optional
 import json
 from arq import Retry, cron
 from arq.worker import func
@@ -31,6 +31,7 @@ async def process_video_task(
     output_format: str = "vertical",
     add_subtitles: bool = True,
     cleanup_settings: Dict[str, Any] | None = None,
+    focus_topics: List[str] | None = None,
 ) -> Dict[str, Any]:
     """
     Background worker task to process a video.
@@ -98,6 +99,7 @@ async def process_video_task(
                 should_cancel=should_cancel,
                 clip_ready_callback=clip_ready_callback,
                 cleanup_settings=cleanup_settings,
+                **({"focus_topics": focus_topics} if focus_topics else {}),
             )
 
             logger.info(f"Task {task_id} completed successfully")

@@ -5,7 +5,7 @@ import Link from "next/link";
 import { useTranslations } from "next-intl";
 import {
   AlertCircle, ArrowRight, ArrowUp, Captions, CaptionsOff, Check, ChevronDown, Crop, FileVideo,
-  Loader2, Paintbrush, Paperclip, Upload, Link2, Wand2, X,
+  Loader2, Paintbrush, Paperclip, Target, Upload, Link2, Wand2, X,
 } from "lucide-react";
 import { CaptionSizeControl } from "@/components/caption-size-control";
 import { VideoSourceIcon } from "@/components/video-source-icon";
@@ -95,6 +95,7 @@ export default function HomeApp() {
   const [pauseThresholdMs, setPauseThresholdMs] = useState("1200");
   const [removeFillerWords, setRemoveFillerWords] = useState(true);
   const [filteredWords, setFilteredWords] = useState("");
+  const [focusTopics, setFocusTopics] = useState("");
 
   const [recent, setRecent] = useState<GenerationSummary[] | null>(null);
   const [billingSummary, updateBillingSummary] = useBillingSummary(Boolean(session?.user?.id));
@@ -239,6 +240,7 @@ export default function HomeApp() {
         ? Math.max(250, Math.min(3000, Math.round(Number(pauseThresholdMs))))
         : 1200;
       const normalizedFilteredWords = filteredWords.split(",").map((word) => word.trim().toLowerCase()).filter(Boolean);
+      const normalizedFocusTopics = focusTopics.split(/[,;\n]/).map((topic) => topic.trim()).filter(Boolean);
 
       if (sourceType === "upload" && file) {
         setStatusMessage(t("status.uploading"));
@@ -260,6 +262,7 @@ export default function HomeApp() {
           pause_threshold_ms: normalizedPauseThreshold,
           remove_filler_words: removeFillerWords,
           filtered_words: normalizedFilteredWords,
+          ...(normalizedFocusTopics.length > 0 && { focus_topics: normalizedFocusTopics }),
         }),
       });
 
@@ -285,6 +288,7 @@ export default function HomeApp() {
         pause_threshold_ms: normalizedPauseThreshold,
         remove_filler_words: removeFillerWords,
         filtered_words: normalizedFilteredWords,
+        focus_topic_count: normalizedFocusTopics.length,
         processing_mode: "fast",
       });
       window.location.href = `/tasks/${startResult.task_id}`;
@@ -582,6 +586,26 @@ export default function HomeApp() {
                     <label htmlFor="filtered-words" className="text-xs font-medium text-muted-foreground">{t("extraWords")}</label>
                     <Input id="filtered-words" value={filteredWords} onChange={(e) => setFilteredWords(e.target.value)} placeholder={t("extraWordsPlaceholder")} className="h-8" />
                   </div>
+                </PopoverContent>
+              </Popover>
+
+              <Popover>
+                <PopoverTrigger asChild>
+                  <Chip disabled={controlsDisabled} active={focusTopics.trim().length > 0}>
+                    <Target className="size-3.5" />{t("focusTopics")}
+                    <ChevronDown className="size-3 opacity-60" />
+                  </Chip>
+                </PopoverTrigger>
+                <PopoverContent align="start" className="w-[min(92vw,340px)] space-y-3 rounded-2xl">
+                  <div>
+                    <p className="text-sm font-medium">{t("focusTopicsTitle")}</p>
+                    <p className="text-xs text-muted-foreground">{t("focusTopicsBody")}</p>
+                  </div>
+                  <div className="space-y-1.5">
+                    <label htmlFor="focus-topics" className="text-xs font-medium text-muted-foreground">{t("focusTopicsLabel")}</label>
+                    <Input id="focus-topics" value={focusTopics} onChange={(e) => setFocusTopics(e.target.value)} placeholder={t("focusTopicsPlaceholder")} maxLength={600} className="h-8" />
+                  </div>
+                  <p className="text-xs text-muted-foreground">{t("focusTopicsHint")}</p>
                 </PopoverContent>
               </Popover>
 

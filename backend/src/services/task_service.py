@@ -3,7 +3,7 @@ Task service - orchestrates task creation and processing workflow.
 """
 
 from sqlalchemy.ext.asyncio import AsyncSession
-from typing import Dict, Any, Optional, Callable
+from typing import Dict, Any, List, Optional, Callable
 import logging
 from datetime import datetime
 from pathlib import Path
@@ -31,6 +31,7 @@ from ..config import Config, get_config
 from ..youtube_utils import cleanup_downloaded_files, extract_video_id
 from ..youtube_source import load_time_map, localize_segment, restore_clip_timeline, transcript_source_for
 from ..clip_cleanup import normalize_clip_cleanup_settings
+from ..focus_topics import normalize_focus_topics
 from ..ai import TRANSCRIPT_ANALYSIS_CACHE_VERSION
 from ..clip_source_map import load_clip_caption_settings
 from ..media_storage import MediaStorage, media_work
@@ -303,6 +304,7 @@ class TaskService(ClipEditingMixin):
         should_cancel: Optional[Callable] = None,
         clip_ready_callback: Optional[Callable] = None,
         cleanup_settings: Optional[Dict[str, Any]] = None,
+        focus_topics: Optional[List[str]] = None,
     ) -> Dict[str, Any]:
         """
         Process a task: download video, analyze, create clips.
@@ -348,6 +350,11 @@ class TaskService(ClipEditingMixin):
             # cache so one creator's history never shapes another's clips.
             performance_context = await self._load_performance_context(user_id)
             if performance_context:
+                cached_analysis_json = None
+            # Focus topics are specific to this task, so they also bypass (and
+            # never populate) the shared analysis cache.
+            focus_topics = normalize_focus_topics(focus_topics)
+            if focus_topics:
                 cached_analysis_json = None
             cache_hit = bool(cached_transcript and cached_analysis_json)
 
@@ -410,6 +417,7 @@ class TaskService(ClipEditingMixin):
                 progress_callback=update_progress,
                 should_cancel=should_cancel,
                 performance_context=performance_context,
+                **({"focus_topics": focus_topics} if focus_topics else {}),
             )
             stage_timings["pipeline_seconds"] = round(
                 perf_counter() - pipeline_start, 3
@@ -433,7 +441,9 @@ class TaskService(ClipEditingMixin):
                     analysis_json=None,
                 )
                 raise ValueError(
-                    "No usable clip segments were selected for this video."
+                    "No moment matching your focus topics was found in this video."
+                    if focus_topics
+                    else "No usable clip segments were selected for this video."
                 )
 
             await self.cache_repo.upsert_cache(
@@ -443,7 +453,9 @@ class TaskService(ClipEditingMixin):
                 source_type=source_type,
                 video_path=MediaStorage().source_reference(url) if url.startswith("upload://s3/") else result.get("video_path"),
                 transcript_text=result.get("transcript"),
-                analysis_json=None if performance_context else result.get("analysis_json"),
+                analysis_json=None
+                if performance_context or focus_topics
+                else result.get("analysis_json"),
             )
 
             video_path = Path(result["video_path"])
