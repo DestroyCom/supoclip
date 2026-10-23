@@ -228,7 +228,9 @@ class WorkerSettings:
     )
 
     # Retry settings
-    max_tries = 3  # Retry failed jobs up to 3 times
+    # arq counts the first run as try 1, so 1 means "never re-run", including
+    # after a worker restart. Raise it with WORKER_MAX_TRIES.
+    max_tries = int(os.getenv("WORKER_MAX_TRIES", "3"))
     # Default is 3 hours; a long CPU Whisper run (and time spent waiting for
     # its turn at the transcription lock) counts against it. Raise it with
     # WORKER_JOB_TIMEOUT_SECONDS.
