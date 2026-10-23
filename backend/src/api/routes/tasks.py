@@ -443,6 +443,9 @@ async def _create_task(request: Request, db: AsyncSession, attempt: SourceAttemp
     if not isinstance(add_subtitles, bool):
         add_subtitles = True
     cleanup_settings = new_task_cleanup_settings(data)
+    # Only an explicit true reruns everything; it is not stored, so a later
+    # resume reuses the fresh results instead of paying for them again.
+    force_rerun = data.get("force_rerun") is True
     if not raw_source or not raw_source.get("url"):
         raise HTTPException(status_code=400, detail="Source URL is required")
 
@@ -532,6 +535,7 @@ async def _create_task(request: Request, db: AsyncSession, attempt: SourceAttemp
                     add_subtitles,
                     cleanup_settings,
                     _job_id=processing_job_id,
+                    **({"force_rerun": True} if force_rerun else {}),
                 )
 
             except Exception:

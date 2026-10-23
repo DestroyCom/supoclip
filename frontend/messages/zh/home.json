@@ -68,6 +68,8 @@
   },
   "captions": "字幕",
   "noCaptions": "无字幕",
+  "forceRerun": "强制完全重新运行",
+  "forceRerunHint": "忽略此视频已保存的所有结果：重新下载、转录并分析。速度更慢，并会消耗转录额度。",
   "cleanup": "清理",
   "cleanupTitle": "片段清理",
   "cleanupBody": "渲染时收紧空白，并切掉填充音。",

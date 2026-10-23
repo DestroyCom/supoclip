@@ -21,6 +21,7 @@ from ..youtube_utils import (
 from ..youtube_proxy import ByteBudget, DownloadBudgetExceeded, PartialDownloadUnavailable, proxy_configured
 from ..youtube_source import (
     cached_full_media,
+    purge_youtube_cache,
     download_audio_for_job,
     materialize_clip_source,
     resolve_full_youtube_download,
@@ -524,6 +525,7 @@ class VideoService:
         progress_callback: Optional[Callable[[int, str, str], Awaitable[None]]] = None,
         should_cancel: Optional[Callable[[], Awaitable[bool]]] = None,
         performance_context: Optional[str] = None,
+        force_rerun: bool = False,
     ) -> Dict[str, Any]:
         """
         Complete video processing pipeline.
@@ -563,6 +565,9 @@ class VideoService:
                 job_budget = ByteBudget(
                     getattr(runtime_config, "youtube_download_max_bytes", 2_000_000_000)
                 )
+                if force_rerun and video_id:
+                    # Total rerun: drop stored downloads so the source is fetched again.
+                    await run_in_thread(purge_youtube_cache, video_id)
                 cached_full = (
                     await run_in_thread(cached_full_media, video_id) if video_id else None
                 )

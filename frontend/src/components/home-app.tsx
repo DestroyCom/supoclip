@@ -5,7 +5,7 @@ import Link from "next/link";
 import { useTranslations } from "next-intl";
 import {
   AlertCircle, ArrowRight, ArrowUp, Captions, CaptionsOff, Check, ChevronDown, Crop, FileVideo,
-  Loader2, Paintbrush, Paperclip, Upload, Link2, Wand2, X,
+  Loader2, Paintbrush, Paperclip, RefreshCw, Upload, Link2, Wand2, X,
 } from "lucide-react";
 import { CaptionSizeControl } from "@/components/caption-size-control";
 import { VideoSourceIcon } from "@/components/video-source-icon";
@@ -91,6 +91,7 @@ export default function HomeApp() {
   const [availableTemplates, setAvailableTemplates] = useState<CaptionTemplate[]>([]);
   const [outputFormat, setOutputFormat] = useState<OutputFormat>("vertical");
   const [addSubtitles, setAddSubtitles] = useState(true);
+  const [forceRerun, setForceRerun] = useState(false);
   const [cutLongPauses, setCutLongPauses] = useState(true);
   const [pauseThresholdMs, setPauseThresholdMs] = useState("1200");
   const [removeFillerWords, setRemoveFillerWords] = useState(true);
@@ -256,6 +257,7 @@ export default function HomeApp() {
           processing_mode: "fast",
           output_format: outputFormat,
           add_subtitles: addSubtitles,
+          ...(forceRerun && { force_rerun: true }),
           cut_long_pauses: cutLongPauses,
           pause_threshold_ms: normalizedPauseThreshold,
           remove_filler_words: removeFillerWords,
@@ -281,6 +283,7 @@ export default function HomeApp() {
         caption_template: captionTemplate,
         output_format: outputFormat,
         add_subtitles: addSubtitles,
+        force_rerun: forceRerun,
         cut_long_pauses: cutLongPauses,
         pause_threshold_ms: normalizedPauseThreshold,
         remove_filler_words: removeFillerWords,
@@ -546,6 +549,11 @@ export default function HomeApp() {
               <Chip onClick={() => setAddSubtitles((value) => !value)} disabled={controlsDisabled} aria-pressed={addSubtitles} active={!addSubtitles}>
                 {addSubtitles ? <Captions className="size-3.5" /> : <CaptionsOff className="size-3.5" />}
                 {addSubtitles ? t("captions") : t("noCaptions")}
+              </Chip>
+
+              <Chip onClick={() => setForceRerun((value) => !value)} disabled={controlsDisabled} aria-pressed={forceRerun} active={forceRerun} title={t("forceRerunHint")}>
+                <RefreshCw className="size-3.5" />
+                {t("forceRerun")}
               </Chip>
 
               <Popover>

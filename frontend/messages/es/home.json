@@ -68,6 +68,8 @@
   },
   "captions": "Subtítulos",
   "noCaptions": "Sin subtítulos",
+  "forceRerun": "Forzar repetición total",
+  "forceRerunHint": "Ignora todo lo guardado de este vídeo: lo descarga, transcribe y analiza de nuevo. Es más lento y consume créditos de transcripción.",
   "cleanup": "Limpieza",
   "cleanupTitle": "Limpieza del clip",
   "cleanupBody": "Reduce los silencios y corta sonidos de relleno al renderizar.",
