@@ -208,3 +208,27 @@ def test_legacy_cache_with_speaker_labels_is_not_whisper(video):
     assert load_reusable_whisper_transcript(
         video, make_config(transcript_cache_trust_legacy=True)
     ) is None
+
+
+def test_reuse_reports_a_single_final_progress_tick(video, monkeypatch):
+    write_cache(video)
+    monkeypatch.setattr(
+        transcription,
+        "transcribe_with_whisper",
+        lambda *_a, **_k: pytest.fail("Whisper must not run"),
+    )
+    ticks = []
+    _get_transcript_with_whisper(
+        video, make_config(), on_progress=lambda *report: ticks.append(report)
+    )
+    assert ticks == [(DURATION, DURATION, 0.0, 0.0)]
+
+
+def test_reuse_propagates_a_stop_request_from_the_progress_hook(video):
+    write_cache(video)
+
+    def stop(*_report):
+        raise transcription.TranscriptionAborted("stopped")
+
+    with pytest.raises(transcription.TranscriptionAborted):
+        _get_transcript_with_whisper(video, make_config(), on_progress=stop)
